@@ -29,6 +29,7 @@ bf16_t bf16_one = (bf16_t) { .bits = 0x3F80}; // BF16_ONE
 bf16_t bf16_two = (bf16_t) { .bits = 0x4000}; // BF16_TWO
 bf16_t bf16_four = (bf16_t) { .bits = 0x4080}; // BF16_FOUR
 bf16_t sign = (bf16_t) {.bits = 0x8000};
+bf16_t two_over_pi_bits = (bf16_t) {.bits = 0b0011111111001001};
 
 static inline bool bf16_isnan(bf16_t a)
 {
@@ -444,6 +445,60 @@ static bf16_t tylor_sin_loop_unrool(bf16_t a)
 	return result;
 }
 
+/* 190 bits of 2/pi for Payne-Hanek style argument reduction. */
+static const unsigned int two_over_pi_f [] = 
+{
+    0x00000000,
+    0x28be60db,
+    0x9391054a,
+    0x7f09d5f4,
+    0x7d4d3770,
+    0x36d8a566,
+    0x4f10e410
+};
+
+/*
+static bf16_t payne_hanek_reduc(bf16_t a)
+{
+	uint16_t exp = (a.bits >> 7) & 0xFF;
+	int16_t unbiased_exp = exp - 127;
+	uint16_t p = 23;
+	uint16_t n = 8; // 7 bit mantissa + 1 implicit bit
+
+
+	//bf16_t bf16_one = (bf16_t) { .bits = 0x3F80}; // BF16_ONE
+	// X = x * 2^n-e-1
+	uint16_t m_exp = 0x0;
+	m_exp += (n-unbiased_exp-1);
+	bf16_t m = (bf16_t) {.bits = 0x0 | (m_exp << 7)};
+
+	uint64_t med = 
+	uint16_t x = bf16_mul(a, m);
+}
+*/
+
+static bf16_t mod_range_reduc(bf16_t *k, bf16_t a)
+{
+	bf16_t quotient = bf16_div(a, two_over_pi_bits);
+	*k = bf16_floor(quotient);
+	a = bf16_sub(a, bf16_mul(*k, two_over_pi_bits));
+
+	printf("\nk: %f, after reduction: %f\n",bf16_to_fp32(*k) ,bf16_to_fp32(a));
+	return a;
+}
+
+static bf16_t cody_waite_reduc(bf16_t *k, bf16_t a)
+{
+	bf16_t c_big = two_over_pi_bits;
+	bf16_t c_small = (bf16_t) { .bits = 0b0011100111111110};
+	bf16_t quotient = bf16_div(a, c_big);
+	*k = bf16_floor(quotient);
+	a = bf16_sub(bf16_sub(a, bf16_mul(*k, c_big)), bf16_mul(*k, c_small));
+	
+	printf("\nk: %f, after reduction: %f\n",bf16_to_fp32(*k) ,bf16_to_fp32(a));
+	return a;
+}
+
 /* using tylor expansion
  * sin(x) = x - x^3/3! + x^5/5! - x^7/7! +...
  * iteration value: (-1)^n * x^2 / (4n^2+2*n)
@@ -457,13 +512,9 @@ static bf16_t bf16_sin(bf16_t a)
 	// Using Cody-Waite's Method
 	bf16_t k, c_big;
 	if (((a.bits >> 7) & 0xFF) >= 0x80) {
-		c_big = (bf16_t) {.bits = 0b0011111111001001};
-		bf16_t c_small = (bf16_t) { .bits = 0b0011100111111110};
-		bf16_t quotient = bf16_div(a, c_big);
-		k = bf16_floor(quotient);
-		bf16_t tmp = bf16_sub(bf16_sub(a, bf16_mul(k, c_big)), bf16_mul(k, c_small));
-		a = tmp;
-		printf("\nk: %f, after reduction: %f\n",bf16_to_fp32(k) ,bf16_to_fp32(a));
+		//a = cody_waite_reduc(&k, a);
+
+		a = mod_range_reduc(&k, a);
 	}
 	
 	// sin(x)
@@ -471,7 +522,7 @@ static bf16_t bf16_sin(bf16_t a)
 	bf16_t sin_x = result;
 
 	// cos(x) = sqrt(1-sin^2(x))
-	a = bf16_add(c_big, a); // sin(pi/2 + x) = cos(x)
+	a = bf16_add(two_over_pi_bits, a); // sin(pi/2 + x) = cos(x)
 	result = tylor_sin_loop_unrool(a);
 	bf16_t cos_x = result;
 
