@@ -24,6 +24,11 @@ typedef struct { uint16_t bits;} bf16_t;
 
 #define BF16_NAN() ((bf16_t) {.bits = 0x7FC0})
 #define BF16_ZERO() ((bf16_t) {.bits = 0x0000})
+	
+bf16_t bf16_one = (bf16_t) { .bits = 0x3F80}; // BF16_ONE
+bf16_t bf16_two = (bf16_t) { .bits = 0x4000}; // BF16_TWO
+bf16_t bf16_four = (bf16_t) { .bits = 0x4080}; // BF16_FOUR
+bf16_t sign = (bf16_t) {.bits = 0x8000};
 
 static inline bool bf16_isnan(bf16_t a)
 {
@@ -63,6 +68,20 @@ static inline float bf16_to_fp32 (bf16_t val)
 	float result;
 	memcpy(&result, &f32bits, sizeof(float));
 	return result;
+}
+
+static inline unsigned clz(uint32_t x)
+{
+    int n = 32, c = 16;
+    do {
+        uint32_t y = x >> c;
+        if (y) {
+            n -= c;
+            x = y;
+        }
+        c >>= 1;
+    } while (c);
+    return n - x; // after interation, x still have one last bit not count, so n = n-x
 }
 
 /*
@@ -108,24 +127,23 @@ static inline bf16_t bf16_add (bf16_t a, bf16_t b)
 
 	// deal with result of exp
 	if(exp_diff > 0) {
-		result_exp = exp_a;
-		if (exp_diff > 8) return a;
-		mant_b >>= exp_diff;
-	} else if (exp_diff < 0) {
 		result_exp = exp_b;
+		if (exp_diff > 8) return a;
+		mant_a <<= exp_diff;
+	} else if (exp_diff < 0) {
+		result_exp = exp_a;
 		if (exp_diff < -8) return b;
-		mant_a >>= -exp_diff;
+		mant_b <<= -exp_diff;
 	}
 	else result_exp = exp_a;
 
 	if (sign_a == sign_b) {
 		result_sign = sign_a;
 		result_mant = (uint32_t) mant_a + mant_b;
-		if (result_mant & 0x100) {
+		uint32_t lz = clz(result_mant);
+		for (unsigned i = 0; i < 32-lz-8; i++){
 			result_mant >>= 1;
-			if (++result_exp >= 0xFF) {
-				return (bf16_t) {.bits = result_sign << 15 | 0x7F80};
-			}
+			if (++result_exp >= 255) return BF16_NAN();
 		}
 	}
 	else {
@@ -138,10 +156,19 @@ static inline bf16_t bf16_add (bf16_t a, bf16_t b)
 			result_mant = mant_b - mant_a;
 		}
 		if (!result_mant) return BF16_ZERO();
-		while (!(result_mant & 0x80)) {
-			result_mant <<= 1;
-			// here, we flush out denormalized value to zero, only return normalized. 
-			if (--result_exp <= 0) return BF16_ZERO();
+		if (result_mant < 0x80) {
+			while (!(result_mant & 0x80)) {
+				result_mant <<= 1;
+				// here, we flush out denormalized value to zero, only return normalized. 
+				if (--result_exp <= 0) return BF16_ZERO();
+			}
+		}
+		else {
+			uint32_t lz = clz(result_mant);
+			for (unsigned i = 0; i < 32-lz-8; i++){
+				result_mant >>= 1;
+				if (++result_exp >= 255) return BF16_NAN();
+			}
 		}
 	}
 	return (bf16_t) {
@@ -367,43 +394,107 @@ static inline bf16_t bf16_div(bf16_t a, bf16_t b)
                              (quotient & 0x7F)};
 }
 
+static bf16_t bf16_floor(bf16_t a)
+{
+	uint16_t sign = (a.bits >> 15) & 0x1;
+	uint16_t exp = (a.bits >> 7) & 0xFF;
+	uint16_t mant = a.bits & 0x7F;
+	int16_t unbiased_exp = exp - 127;
+
+	if (unbiased_exp < 7) {
+		mant >>= 7 - unbiased_exp;
+		mant <<= 7 - unbiased_exp;
+	}
+	
+	return (bf16_t) {.bits = (sign << 15) | ((exp & 0xFF) << 7) | (mant & 0x7F)};
+}
+
+static uint32_t bf16_to_uint32(bf16_t a)
+{
+	uint16_t exp = (a.bits >> 7) & 0xFF;
+	uint16_t mant = a.bits & 0x7F;
+	mant |= 0x80;
+	int16_t unbiased_exp = exp - 127;
+
+	if (unbiased_exp >= 7) mant <<= (unbiased_exp - 7);
+	if (unbiased_exp >= 0 && unbiased_exp < 7) mant >>= (7 - unbiased_exp);
+
+	return mant;
+}
+
+static inline void tylor_sin(bf16_t *result, bf16_t *it, bf16_t *it_deno, bf16_t *it_mole, bf16_t *it_n)
+{	
+	*it_deno = bf16_add(bf16_mul(bf16_four, bf16_mul(*it_n, *it_n)), bf16_mul(bf16_two, *it_n));
+	*it = bf16_mul(*it, *it_mole);
+	*it = bf16_div(*it, *it_deno);
+	it->bits ^= sign.bits;
+	*it_n = bf16_add(*it_n, bf16_one);
+	
+	*result = bf16_add(*result, *it);
+}
+
+static bf16_t tylor_sin_loop_unrool(bf16_t a)
+{
+	bf16_t result = a, it_mole = bf16_mul(a, a), it_deno, it = a, it_n = bf16_one;
+
+	tylor_sin(&result, &it, &it_deno, &it_mole, &it_n);
+	tylor_sin(&result, &it, &it_deno, &it_mole, &it_n);
+	tylor_sin(&result, &it, &it_deno, &it_mole, &it_n);
+
+	return result;
+}
+
 /* using tylor expansion
  * sin(x) = x - x^3/3! + x^5/5! - x^7/7! +...
  * iteration value: (-1)^n * x^2 / (4n^2+2*n)
  *
  * optimize:
- * loop unrooling, avoid unneeded calculation for too small tylar value.
+ * loop unrooling, avoid unneeded calculation for too small tylor value.
  */
 static bf16_t bf16_sin(bf16_t a)
 {
-	// TODO: restrict a between -2pi to +2pi
-	
-	bf16_t result = a;
-	bf16_t bf16_one = (bf16_t) { .bits = 0x3F80}; // BF16_ONE
-	bf16_t bf16_two = (bf16_t) { .bits = 0x4000}; // BF16_TWO
-	bf16_t bf16_four = (bf16_t) { .bits = 0x4080}; // BF16_FOUR
-	bf16_t it_n = bf16_one;
-	bf16_t it_sign = (bf16_t) { .bits = 0x8000};
-	bf16_t it_mole = bf16_mul(a, a);
-	bf16_t it_deno;
-	bf16_t it = a;
-	unsigned i;
-	for(i = 1; i < 100; i++){
-		it_deno = bf16_add(bf16_mul(bf16_four, bf16_mul(it_n, it_n)), bf16_mul(bf16_two, it_n));
-		if (bf16_isnan(it_deno) || bf16_isinf(it_deno) || bf16_iszero(it_deno)) break;
-	       	it = bf16_mul(it, it_mole);
-		if (bf16_isnan(it) || bf16_isinf(it) || bf16_iszero(it)) break;
-		it = bf16_div(it, it_deno);
-		if (bf16_isnan(it) || bf16_isinf(it) || bf16_iszero(it)) break;
-		it.bits ^= it_sign.bits;
-		it_n = bf16_add(it_n, bf16_one);
-		
-		// result add iteration
-		result = bf16_add(result, it);
+	// TODO: judge is a out of rage -pi/2 to +pi/2. current judgment not good
+	// Using Cody-Waite's Method
+	bf16_t k, c_big;
+	if (((a.bits >> 7) & 0xFF) >= 0x80) {
+		c_big = (bf16_t) {.bits = 0b0011111111001001};
+		bf16_t c_small = (bf16_t) { .bits = 0b0011100111111110};
+		bf16_t quotient = bf16_div(a, c_big);
+		k = bf16_floor(quotient);
+		bf16_t tmp = bf16_sub(bf16_sub(a, bf16_mul(k, c_big)), bf16_mul(k, c_small));
+		a = tmp;
+		printf("\nk: %f, after reduction: %f\n",bf16_to_fp32(k) ,bf16_to_fp32(a));
 	}
+	
+	// sin(x)
+	bf16_t result = tylor_sin_loop_unrool(a);
+	bf16_t sin_x = result;
 
-	printf("\niteration times: %d\n", i);
+	// cos(x) = sqrt(1-sin^2(x))
+	a = bf16_add(c_big, a); // sin(pi/2 + x) = cos(x)
+	result = tylor_sin_loop_unrool(a);
+	bf16_t cos_x = result;
 
+	// k mod 4
+	uint32_t k_int = bf16_to_uint32(k); 
+	unsigned mod_k = k_int % 4;
+	
+	switch (mod_k) {
+		case 0:
+			result = sin_x;
+			break;
+		case 1:
+			result = cos_x;
+			break;
+		case 2:
+			result = (bf16_t) {.bits = sin_x.bits ^ 0x8000};
+			break;
+		case 3:
+			result = (bf16_t) {.bits = cos_x.bits ^ 0x8000};
+			break;
+	}
+	
+	printf("sin(r) = %f, cos(r) = %f, k_int = %d, mod_k = %d\n", bf16_to_fp32(sin_x), bf16_to_fp32(cos_x),k_int, mod_k);
 	return result;
 }
 
@@ -415,17 +506,18 @@ int main()
 	bf16_t d = bf16_mul2(c);
 
 	bf16_t x = {.bits = 0x4000};
-	bf16_t arr_bf16[7];
+	bf16_t arr_bf16[8];
 	arr_bf16[0] = (bf16_t){.bits = 0x3f80}; // 1
         arr_bf16[1] = (bf16_t){.bits = 0x4000}; // 2
 	arr_bf16[2] = (bf16_t){.bits = 0b0100000100100000}; // 10
 	arr_bf16[3] = (bf16_t){.bits = 0b0100001011001000}; // 100
 	arr_bf16[4] = (bf16_t){.bits = 0}; // 0
-	arr_bf16[5] = (bf16_t){.bits = 0b0011111111001001}; // pi/2
-	arr_bf16[6] = (bf16_t){.bits = 0x4080};
+	arr_bf16[5] = (bf16_t){.bits = 0b0100000001001001}; // pi
+	arr_bf16[6] = (bf16_t){.bits = 0x4100}; // 8
+	arr_bf16[7] = (bf16_t){.bits = 0x410a}; // (11/4)pi
 
-	for(int i = 0; i < 7; i++){
-		printf("x = %f, sin(x) = %f\n", bf16_to_fp32(arr_bf16[i]), bf16_to_fp32(bf16_sin(arr_bf16[i])));
+	for(int i = 0; i < 8; i++){
+		printf("x = %f, sin(x) = %f\n\n", bf16_to_fp32(arr_bf16[i]), bf16_to_fp32(bf16_sin(arr_bf16[i])));
 	}
 	return 0;
 }
