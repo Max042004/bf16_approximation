@@ -14,6 +14,8 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdbool.h>
+#include <math.h>
+#include <stdlib.h>
 
 typedef struct { uint16_t bits;} bf16_t;
 
@@ -413,7 +415,7 @@ static bf16_t bf16_floor(bf16_t a)
 static uint32_t bf16_to_uint32(bf16_t a)
 {
 	uint16_t exp = (a.bits >> 7) & 0xFF;
-	uint16_t mant = a.bits & 0x7F;
+	uint32_t mant = a.bits & 0x7F;
 	mant |= 0x80;
 	int16_t unbiased_exp = exp - 127;
 
@@ -422,6 +424,25 @@ static uint32_t bf16_to_uint32(bf16_t a)
 
 	return mant;
 }
+
+/*static uint32_t bf16_to_uint32(bf16_t a) {
+    uint32_t fbits = (uint32_t)a.bits << 16;
+    float f;
+    memcpy(&f, &fbits, sizeof f);
+
+    if (isnan(f)) {
+        return 0;
+    }
+    if (isinf(f)) {
+        return (f > 0.0f) ? UINT32_MAX : 0;
+    }
+    if (f <= 0.0f) return 0;
+
+    // 如果 f 超出 uint32 範圍，返回上界 
+    if (f >= (float)UINT32_MAX) return UINT32_MAX;
+
+    return (uint32_t)f; 
+}*/
 
 static inline void tylor_sin(bf16_t *result, bf16_t *it, bf16_t *it_deno, bf16_t *it_mole, bf16_t *it_n)
 {	
@@ -445,37 +466,86 @@ static bf16_t tylor_sin_loop_unrool(bf16_t a)
 	return result;
 }
 
-/* 190 bits of 2/pi for Payne-Hanek style argument reduction. */
-static const unsigned int two_over_pi_f [] = 
-{
-    0x00000000,
-    0x28be60db,
-    0x9391054a,
-    0x7f09d5f4,
-    0x7d4d3770,
-    0x36d8a566,
-    0x4f10e410
+// 200 bits for 2/pi
+static const uint8_t two_over_pi_byte[27] = {
+    0xA2, 0xF8, 0xC1, 0xB7, 0x27, 0x22, 0x0A, 0x94,
+    0xFE, 0x13, 0xA7, 0x55, 0xF4, 0x3E, 0xA6, 0xD7,
+    0xC0, 0x6D, 0xB1, 0x4A, 0xCC, 0x9E, 0x21, 0xC8,
+    0x20, 0xFF, 0x28
 };
 
-/*
-static bf16_t payne_hanek_reduc(bf16_t a)
+typedef union {
+	float f;
+	uint32_t bits;
+} fp32_bits;
+
+static bf16_t payne_hanek_reduc(bf16_t *k, bf16_t a)
 {
+	bf16_t quotient = bf16_div(a, two_over_pi_bits);
+	*k = bf16_floor(quotient);
+
 	uint16_t exp = (a.bits >> 7) & 0xFF;
 	int16_t unbiased_exp = exp - 127;
-	uint16_t p = 23;
+	uint16_t p = 8;
 	uint16_t n = 8; // 7 bit mantissa + 1 implicit bit
 
 
 	//bf16_t bf16_one = (bf16_t) { .bits = 0x3F80}; // BF16_ONE
 	// X = x * 2^n-e-1
-	uint16_t m_exp = 0x0;
-	m_exp += (n-unbiased_exp-1);
-	bf16_t m = (bf16_t) {.bits = 0x0 | (m_exp << 7)};
+	int16_t tmp = (n-unbiased_exp-1) << 7;
+	if (tmp > 0) a.bits += tmp;
+	else a.bits -= abs(tmp);
+	bf16_t val = a;
+	uint32_t tailx = bf16_to_uint32(val);
 
-	uint64_t med = 
-	uint16_t x = bf16_mul(a, m);
+
+	/*
+	   C = 0.v0 v1 v2 v3 v4...
+	         -1 -2 -3 -4 -5...
+	   whole bits are divide into three parts Left(e,p), Med(e,p), Right(e,p)
+	   which only Med(e,p) influence the range reduction.
+	 */
+	int16_t start_bit = -1;
+	// check how many bits for Left(e,p) 
+	int16_t left_last = n-unbiased_exp+1;
+	if (left_last < -1) start_bit = left_last - 1;
+
+	// total bits for Med(e,p) = 2n + p + 2
+	uint16_t last_bit = ((n << 1) + p + 2) + abs(start_bit) - 1;
+	// align for array index
+	last_bit -= 1;
+	start_bit += 1; 
+	uint16_t byte_start = abs(start_bit) / 8;
+	uint16_t byte_last = last_bit / 8;
+	uint16_t mod_start = abs(start_bit) % 8;
+	uint16_t mod_last = last_bit % 8;
+
+	uint64_t med = 0x0;
+	for (unsigned int i = byte_start, j = byte_last-byte_start; i <= byte_last; i++, j--) {
+		med |= ((uint64_t) two_over_pi_byte[i] << (j<<3)); // here, it will add unneeded bits
+	}
+
+	uint16_t med_clz = clz(med);
+	// flush out additional unneeded bits
+	med <<= (med_clz + mod_start);
+	med >>= (med_clz + mod_start);
+	med >>= (7 - mod_last);
+
+	// Med*tailx*2^{-16-p}, using uint32_t to store
+	uint64_t medmulx = med * tailx;
+	uint64_t tmp_result  =  medmulx << (64-(n<<1)-p-1);
+	uint32_t frac = (uint32_t) (tmp_result >> (64-(n<<1)-p-1)); // only retain 2n+p+1 bits
+
+	fp32_bits fp32_frac = (fp32_bits) {.bits = 0x0};
+	fp32_frac.bits = fp32_frac.bits | 0x3F800000 | ((frac >> ((n<<1)+p+1-23)) & 0x7FFFFF); 
+	fp32_frac.f -= 1;// frac = 1.xxxxxx - 1
+	float pi_over_twof = 1.5707963;
+	float result =  pi_over_twof * fp32_frac.f;
+
+	a = fp32_to_bf16(result);
+	printf("\nk: %f, after payne_hanek reduction: %f\n",bf16_to_fp32(*k) ,bf16_to_fp32(a));
+	return a;
 }
-*/
 
 static bf16_t mod_range_reduc(bf16_t *k, bf16_t a)
 {
@@ -483,7 +553,7 @@ static bf16_t mod_range_reduc(bf16_t *k, bf16_t a)
 	*k = bf16_floor(quotient);
 	a = bf16_sub(a, bf16_mul(*k, two_over_pi_bits));
 
-	printf("\nk: %f, after reduction: %f\n",bf16_to_fp32(*k) ,bf16_to_fp32(a));
+	printf("\nk: %f, after naive mod reduction: %f\n",bf16_to_fp32(*k) ,bf16_to_fp32(a));
 	return a;
 }
 
@@ -495,7 +565,7 @@ static bf16_t cody_waite_reduc(bf16_t *k, bf16_t a)
 	*k = bf16_floor(quotient);
 	a = bf16_sub(bf16_sub(a, bf16_mul(*k, c_big)), bf16_mul(*k, c_small));
 	
-	printf("\nk: %f, after reduction: %f\n",bf16_to_fp32(*k) ,bf16_to_fp32(a));
+	printf("\nk: %f, after cody-waite reduction: %f\n",bf16_to_fp32(*k) ,bf16_to_fp32(a));
 	return a;
 }
 
@@ -511,10 +581,11 @@ static bf16_t bf16_sin(bf16_t a)
 	// TODO: judge is a out of rage -pi/2 to +pi/2. current judgment not good
 	// Using Cody-Waite's Method
 	bf16_t k, c_big;
-	if (((a.bits >> 7) & 0xFF) >= 0x80) {
-		//a = cody_waite_reduc(&k, a);
-
-		a = mod_range_reduc(&k, a);
+	uint32_t exp = (a.bits >> 7) & 0xFF;
+	if (exp >= 0x80) {
+		if (exp > 0x84) a = payne_hanek_reduc(&k, a);
+		else a = cody_waite_reduc(&k, a);
+		//a = mod_range_reduc(&k, a);
 	}
 	
 	// sin(x)
@@ -557,7 +628,7 @@ int main()
 	bf16_t d = bf16_mul2(c);
 
 	bf16_t x = {.bits = 0x4000};
-	bf16_t arr_bf16[8];
+	bf16_t arr_bf16[13];
 	arr_bf16[0] = (bf16_t){.bits = 0x3f80}; // 1
         arr_bf16[1] = (bf16_t){.bits = 0x4000}; // 2
 	arr_bf16[2] = (bf16_t){.bits = 0b0100000100100000}; // 10
@@ -566,8 +637,11 @@ int main()
 	arr_bf16[5] = (bf16_t){.bits = 0b0100000001001001}; // pi
 	arr_bf16[6] = (bf16_t){.bits = 0x4100}; // 8
 	arr_bf16[7] = (bf16_t){.bits = 0x410a}; // (11/4)pi
+	arr_bf16[8] = (bf16_t){.bits = 0b0100001010110100}; // 90
+	arr_bf16[9] = (bf16_t){.bits = 0b0100001010000000}; // 64
+	arr_bf16[10] = (bf16_t){.bits = 0b0100001010000010}; // 65
 
-	for(int i = 0; i < 8; i++){
+	for(int i = 0; i < 13; i++){
 		printf("x = %f, sin(x) = %f\n\n", bf16_to_fp32(arr_bf16[i]), bf16_to_fp32(bf16_sin(arr_bf16[i])));
 	}
 	return 0;
