@@ -1,4 +1,6 @@
 /*
+	bfloat quotient = bf16_to_fp32(a) / bf16_to_fp32(pi_over_two_bits);
+	*k = floorf(quotient);
  * Bfloat16: 0bxxxxxxxxxxxxxxxx
  *	       ||______||_____|
  *             |    |      |
@@ -31,7 +33,8 @@ bf16_t bf16_one = (bf16_t) { .bits = 0x3F80}; // BF16_ONE
 bf16_t bf16_two = (bf16_t) { .bits = 0x4000}; // BF16_TWO
 bf16_t bf16_four = (bf16_t) { .bits = 0x4080}; // BF16_FOUR
 bf16_t sign = (bf16_t) {.bits = 0x8000};
-bf16_t two_over_pi_bits = (bf16_t) {.bits = 0b0011111111001001};
+bf16_t pi_over_two_bits = (bf16_t) {.bits = 0b0011111111001001};
+float pi_over_two_float = 1.5707962512969970703125;
 
 static inline bool bf16_isnan(bf16_t a)
 {
@@ -425,25 +428,6 @@ static uint32_t bf16_to_uint32(bf16_t a)
 	return mant;
 }
 
-/*static uint32_t bf16_to_uint32(bf16_t a) {
-    uint32_t fbits = (uint32_t)a.bits << 16;
-    float f;
-    memcpy(&f, &fbits, sizeof f);
-
-    if (isnan(f)) {
-        return 0;
-    }
-    if (isinf(f)) {
-        return (f > 0.0f) ? UINT32_MAX : 0;
-    }
-    if (f <= 0.0f) return 0;
-
-    // 如果 f 超出 uint32 範圍，返回上界 
-    if (f >= (float)UINT32_MAX) return UINT32_MAX;
-
-    return (uint32_t)f; 
-}*/
-
 static inline void tylor_sin(bf16_t *result, bf16_t *it, bf16_t *it_deno, bf16_t *it_mole, bf16_t *it_n)
 {	
 	*it_deno = bf16_add(bf16_mul(bf16_four, bf16_mul(*it_n, *it_n)), bf16_mul(bf16_two, *it_n));
@@ -462,8 +446,105 @@ static bf16_t tylor_sin_loop_unrool(bf16_t a)
 	tylor_sin(&result, &it, &it_deno, &it_mole, &it_n);
 	tylor_sin(&result, &it, &it_deno, &it_mole, &it_n);
 	tylor_sin(&result, &it, &it_deno, &it_mole, &it_n);
+	tylor_sin(&result, &it, &it_deno, &it_mole, &it_n);
+	tylor_sin(&result, &it, &it_deno, &it_mole, &it_n);
+	tylor_sin(&result, &it, &it_deno, &it_mole, &it_n);
+	tylor_sin(&result, &it, &it_deno, &it_mole, &it_n);
 
 	return result;
+}
+
+static bf16_t chebyshev_sin_5terms(bf16_t a)
+{
+	float para = bf16_to_fp32(a);
+	float x_2 = para*para;
+	float x_3 = x_2*para;
+	float x_4 = x_3*para;
+	float result = 0.0368*x_4-0.2311*x_3+0.0489*x_2+0.9867*para+0.0005833;
+	// degress 5 to small, so ignore
+	return fp32_to_bf16(result);
+}
+
+static bf16_t chebyshev_sin_6terms(float a)
+{
+	float para = a;
+	float result;
+	result = 0.0102485642486;
+	result -= (0.000960664234092 * para);
+	result *= para;
+	result -= 0.0019022700092;
+	result *= para;
+	result -= 0.165722549388;
+	result *= para;
+	result -= 0.000206058500652;
+	result *= para;
+	result += 1.00001322248;
+	result *= para;
+	return fp32_to_bf16(result);
+}
+
+/* 190 bits of 2/pi for Payne-Hanek style argument reduction. */
+static const unsigned int two_over_pi_f [] = 
+{
+    0x00000000,
+    0x28be60db,
+    0x9391054a,
+    0x7f09d5f4,
+    0x7d4d3770,
+    0x36d8a566,
+    0x4f10e410
+};
+
+float trig_red_slowpath_f (float a, int *quadrant)
+{
+    unsigned long long int p;
+    unsigned int ia, hi, mid, lo, i;
+    int e, q;
+    float r;
+
+    ia = (unsigned int)(fabsf (frexpf (a, &e)) * 0x1.0p32f);
+
+    /* extract 96 relevant bits of 2/pi based on magnitude of argument */ 
+    i = (unsigned int)e >> 5;
+    e = (unsigned int)e & 31;
+
+    if (e) {
+        hi  = (two_over_pi_f [i+0] << e) | (two_over_pi_f [i+1] >> (32 - e));
+        mid = (two_over_pi_f [i+1] << e) | (two_over_pi_f [i+2] >> (32 - e));
+        lo  = (two_over_pi_f [i+2] << e) | (two_over_pi_f [i+3] >> (32 - e));
+    } else {
+        hi  = two_over_pi_f [i+0];
+        mid = two_over_pi_f [i+1];
+        lo  = two_over_pi_f [i+2];
+    }
+
+    /* compute product x * 2/pi in 2.62 fixed-point format */
+    p = (unsigned long long int)ia * lo;
+    p = (unsigned long long int)ia * mid + (p >> 32);
+    p = ((unsigned long long int)(ia * hi) << 32) + p;
+
+    /* round quotient to nearest */
+    q = (int)(p >> 62);                // integral portion = quadrant<1:0>
+    p = p & 0x3fffffffffffffffULL;     // fraction
+    if (p & 0x2000000000000000ULL) {   // fraction >= 0.5
+        p = p - 0x4000000000000000ULL; // fraction - 1.0
+        q = q + 1;
+    }
+
+    /* compute remainder of x / (pi/2) */
+    double d;
+
+    d = (double)(long long int)p;
+    d = d * 0x1.921fb54442d18p-62; // 1.5707963267948966 * 0x1.0p-62
+    r = (float)d;
+    if (a < 0.0f) {
+        r = -r;
+        q = -q;
+    }
+
+    printf("After payne_hanek\n");
+    *quadrant = q;
+    return r;
 }
 
 // 200 bits for 2/pi
@@ -475,132 +556,95 @@ static const uint8_t two_over_pi_byte[27] = {
 };
 
 typedef union {
-	float f;
-	uint32_t bits;
-} fp32_bits;
+	double f;
+	uint64_t bits;
+} fp64_bits;
 
-static bf16_t payne_hanek_reduc(bf16_t *k, bf16_t a)
+static bf16_t quot(bf16_t a)
 {
-	bf16_t quotient = bf16_div(a, two_over_pi_bits);
-	*k = bf16_floor(quotient);
-
+	// a*(2/pi), using fixed point Q2.30
+	uint16_t sign = (a.bits >> 15) & 0x1;
 	uint16_t exp = (a.bits >> 7) & 0xFF;
+	uint32_t mant = a.bits & 0x7F;
 	int16_t unbiased_exp = exp - 127;
-	uint16_t p = 8;
-	uint16_t n = 8; // 7 bit mantissa + 1 implicit bit
 
+	// Q2.30
+	mant |= 0x80;
+	mant <<= 23;
+	uint32_t two_over_pi_bits = (two_over_pi_byte[0]<<22) | (two_over_pi_byte[1]<<14)
+	    | (two_over_pi_byte[2]<<6) | (two_over_pi_byte[3]>>2);
 
-	//bf16_t bf16_one = (bf16_t) { .bits = 0x3F80}; // BF16_ONE
-	// X = x * 2^n-e-1
-	int16_t tmp = (n-unbiased_exp-1) << 7;
-	if (tmp > 0) a.bits += tmp;
-	else a.bits -= abs(tmp);
-	bf16_t val = a;
-	uint32_t tailx = bf16_to_uint32(val);
-
-
-	/*
-	   C = 0.v0 v1 v2 v3 v4...
-	         -1 -2 -3 -4 -5...
-	   whole bits are divide into three parts Left(e,p), Med(e,p), Right(e,p)
-	   which only Med(e,p) influence the range reduction.
-	 */
-	int16_t start_bit = -1;
-	// check how many bits for Left(e,p) 
-	int16_t left_last = n-unbiased_exp+1;
-	if (left_last < -1) start_bit = left_last - 1;
-
-	// total bits for Med(e,p) = 2n + p + 2
-	uint16_t last_bit = ((n << 1) + p + 2) + abs(start_bit) - 1;
-	// align for array index
-	last_bit -= 1;
-	start_bit += 1; 
-	uint16_t byte_start = abs(start_bit) / 8;
-	uint16_t byte_last = last_bit / 8;
-	uint16_t mod_start = abs(start_bit) % 8;
-	uint16_t mod_last = last_bit % 8;
-
-	uint64_t med = 0x0;
-	for (unsigned int i = byte_start, j = byte_last-byte_start; i <= byte_last; i++, j--) {
-		med |= ((uint64_t) two_over_pi_byte[i] << (j<<3)); // here, it will add unneeded bits
+	uint32_t quo = ((uint64_t)mant * two_over_pi_bits) >> 30;
+	if (quo >> 30 == 0) {
+		exp -= 1;
+		quo <<= 1;
 	}
 
-	uint16_t med_clz = clz(med);
-	// flush out additional unneeded bits
-	med <<= (med_clz + mod_start);
-	med >>= (med_clz + mod_start);
-	med >>= (7 - mod_last);
-
-	// Med*tailx*2^{-16-p}, using uint32_t to store
-	uint64_t medmulx = med * tailx;
-	uint64_t tmp_result  =  medmulx << (64-(n<<1)-p-1);
-	uint32_t frac = (uint32_t) (tmp_result >> (64-(n<<1)-p-1)); // only retain 2n+p+1 bits
-
-	fp32_bits fp32_frac = (fp32_bits) {.bits = 0x0};
-	fp32_frac.bits = fp32_frac.bits | 0x3F800000 | ((frac >> ((n<<1)+p+1-23)) & 0x7FFFFF); 
-	fp32_frac.f -= 1;// frac = 1.xxxxxx - 1
-	float pi_over_twof = 1.5707963;
-	float result =  pi_over_twof * fp32_frac.f;
-
-	a = fp32_to_bf16(result);
-	printf("\nk: %f, after payne_hanek reduction: %f\n",bf16_to_fp32(*k) ,bf16_to_fp32(a));
-	return a;
+    	return (bf16_t) {.bits = (sign << 15) | ((exp & 0xFF) << 7) |
+                             ((quo >> 23) & 0x7F)};
 }
 
 static bf16_t mod_range_reduc(bf16_t *k, bf16_t a)
 {
-	bf16_t quotient = bf16_div(a, two_over_pi_bits);
+	bf16_t quotient = bf16_div(a, pi_over_two_bits);
 	*k = bf16_floor(quotient);
-	a = bf16_sub(a, bf16_mul(*k, two_over_pi_bits));
+	a = bf16_sub(a, bf16_mul(*k, pi_over_two_bits));
 
 	printf("\nk: %f, after naive mod reduction: %f\n",bf16_to_fp32(*k) ,bf16_to_fp32(a));
 	return a;
 }
 
+/*
+ * C = C1+C2+C3
+ * x* = x-kC = x-kC1-kC2-kC3 = ((x-kC1)-kC2)-kC3
+ */
 static bf16_t cody_waite_reduc(bf16_t *k, bf16_t a)
 {
-	bf16_t c_big = two_over_pi_bits;
-	bf16_t c_small = (bf16_t) { .bits = 0b0011100111111110};
-	bf16_t quotient = bf16_div(a, c_big);
-	*k = bf16_floor(quotient);
-	a = bf16_sub(bf16_sub(a, bf16_mul(*k, c_big)), bf16_mul(*k, c_small));
+	bf16_t c_big = pi_over_two_bits;
+	bf16_t c_med = (bf16_t) { .bits = 0b0011100111111100};
+	bf16_t c_sm = (bf16_t) {.bits = 0b0011011001010100};
+	*k = quot(a);
+	*k = bf16_floor(*k);
+	a = bf16_sub(bf16_sub(bf16_sub(a, bf16_mul(*k, c_big)), bf16_mul(*k, c_med)), bf16_mul(*k, c_sm));
 	
 	printf("\nk: %f, after cody-waite reduction: %f\n",bf16_to_fp32(*k) ,bf16_to_fp32(a));
 	return a;
 }
 
-/* using tylor expansion
- * sin(x) = x - x^3/3! + x^5/5! - x^7/7! +...
- * iteration value: (-1)^n * x^2 / (4n^2+2*n)
- *
- * optimize:
- * loop unrooling, avoid unneeded calculation for too small tylor value.
- */
-static bf16_t bf16_sin(bf16_t a)
+static bf16_t bf16_sin(bf16_t a, int *record_k)
 {
-	// TODO: judge is a out of rage -pi/2 to +pi/2. current judgment not good
-	// Using Cody-Waite's Method
-	bf16_t k, c_big;
-	uint32_t exp = (a.bits >> 7) & 0xFF;
-	if (exp >= 0x80) {
-		if (exp > 0x84) a = payne_hanek_reduc(&k, a);
-		else a = cody_waite_reduc(&k, a);
-		//a = mod_range_reduc(&k, a);
+	bf16_t k;
+	int32_t kpayne;
+	uint16_t isPayne = 0;
+	if ((a.bits & 0x7FFF) < 0b0011111000010000) {
+		printf("directly return a\n");
+		return a;
+	} 
+	if ((a.bits & 0x7FFF) >= 0b0011111111001010) {
+		a = fp32_to_bf16(trig_red_slowpath_f(bf16_to_fp32(a), &kpayne));
+		isPayne = 1;
 	}
 	
 	// sin(x)
-	bf16_t result = tylor_sin_loop_unrool(a);
+	printf("angle after range reduction: %f\n", bf16_to_fp32(a));
+	bf16_t result = chebyshev_sin_6terms(bf16_to_fp32(a));
 	bf16_t sin_x = result;
 
 	// cos(x) = sqrt(1-sin^2(x))
-	a = bf16_add(two_over_pi_bits, a); // sin(pi/2 + x) = cos(x)
-	result = tylor_sin_loop_unrool(a);
+	//bf16_t cos_a = bf16_add(pi_over_two_bits, a);
+	float cos_a = pi_over_two_float + bf16_to_fp32(a);
+	result = chebyshev_sin_6terms(cos_a);
 	bf16_t cos_x = result;
 
 	// k mod 4
-	uint32_t k_int = bf16_to_uint32(k); 
+	uint32_t k_int;
+	if (isPayne){
+		k_int = (uint32_t) kpayne;
+	}
+	else {
+		k_int = bf16_to_uint32(k); 
+	}
 	unsigned mod_k = k_int % 4;
-	
 	switch (mod_k) {
 		case 0:
 			result = sin_x;
@@ -616,33 +660,40 @@ static bf16_t bf16_sin(bf16_t a)
 			break;
 	}
 	
+	*record_k = mod_k;
 	printf("sin(r) = %f, cos(r) = %f, k_int = %d, mod_k = %d\n", bf16_to_fp32(sin_x), bf16_to_fp32(cos_x),k_int, mod_k);
 	return result;
 }
 
 int main()
 {
-	bf16_t a = {.bits = 0x7fff};
-	bf16_t c = {.bits = 0x7aff};
-	bf16_t b = bf16_mul2(a);
-	bf16_t d = bf16_mul2(c);
+	FILE *f = fopen("./log.txt", "w");
+	FILE *fk = fopen("./klog.txt", "w");
+	
+	/* x between [pi/2, 0] 
+	 * bf16_t i = (bf16_t){.bits = 0b0011111111001001}; // Initial
+	int j = 0;
+	for (j; j < 450; j++){
+		printf("%f\n", bf16_to_fp32(i));
+		float glibc_sin = bf16_to_fp32(fp32_to_bf16(sinf(bf16_to_fp32(i))));
+		float payne = bf16_to_fp32(bf16_sin(i));
+		printf("i = %f, bf16_sin = %f ,glibc_sin = %f\n", bf16_to_fp32(i), payne, glibc_sin);
+		fprintf(f, "%f\n",fabs(payne-glibc_sin));
+		i.bits--;
+	}*/
 
-	bf16_t x = {.bits = 0x4000};
-	bf16_t arr_bf16[13];
-	arr_bf16[0] = (bf16_t){.bits = 0x3f80}; // 1
-        arr_bf16[1] = (bf16_t){.bits = 0x4000}; // 2
-	arr_bf16[2] = (bf16_t){.bits = 0b0100000100100000}; // 10
-	arr_bf16[3] = (bf16_t){.bits = 0b0100001011001000}; // 100
-	arr_bf16[4] = (bf16_t){.bits = 0}; // 0
-	arr_bf16[5] = (bf16_t){.bits = 0b0100000001001001}; // pi
-	arr_bf16[6] = (bf16_t){.bits = 0x4100}; // 8
-	arr_bf16[7] = (bf16_t){.bits = 0x410a}; // (11/4)pi
-	arr_bf16[8] = (bf16_t){.bits = 0b0100001010110100}; // 90
-	arr_bf16[9] = (bf16_t){.bits = 0b0100001010000000}; // 64
-	arr_bf16[10] = (bf16_t){.bits = 0b0100001010000010}; // 65
-
-	for(int i = 0; i < 13; i++){
-		printf("x = %f, sin(x) = %f\n\n", bf16_to_fp32(arr_bf16[i]), bf16_to_fp32(bf16_sin(arr_bf16[i])));
+	// x larger than pi/2, need range reduction
+	bf16_t i = (bf16_t){.bits = 0b0011111111001010}; // Initial
+	int j = 0, record_k;
+	for (j; j < 16310; j++){
+		float glibc_sin = bf16_to_fp32(fp32_to_bf16(sinf(bf16_to_fp32(i))));
+		float payne = bf16_to_fp32(bf16_sin(i, &record_k));
+		printf("i = %f, bf16_sin = %f ,glibc_sin = %f\n\n", bf16_to_fp32(i), payne, glibc_sin);
+		if (fabs(payne-glibc_sin) > 0) fprintf(fk, "%d\n", record_k);
+		fprintf(f, "%f\n",fabs(payne-glibc_sin));
+		i.bits++;
 	}
+
+	fclose(f);
 	return 0;
 }
