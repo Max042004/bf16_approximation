@@ -445,7 +445,7 @@ static const unsigned int two_over_pi_f [] =
     0x4f10e410
 };
 
-float trig_red_slowpath_f (float a, int *quadrant)
+float payne_hanek_reduc (float a, int *quadrant)
 {
     unsigned long long int p;
     unsigned int ia, hi, mid, lo, i;
@@ -512,7 +512,7 @@ static bf16_t bf16_sin(bf16_t a, int *record_k)
 
 	// range reduction	
 	if ((a.bits & 0x7FFF) >= 0b0011111111001010) {
-		a = fp32_to_bf16(trig_red_slowpath_f(bf16_to_fp32(a), &k));
+		a = fp32_to_bf16(payne_hanek_reduc(bf16_to_fp32(a), &k));
 		printf("Angle after range reduction: %f\n", bf16_to_fp32(a));
 	}
 	
