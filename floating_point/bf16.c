@@ -519,11 +519,10 @@ static bf16_t bf16_sin(bf16_t a, int *record_k)
 	// sin(x)
 	bf16_t sin_x = chebyshev_sin_6terms(bf16_to_fp32(a));
 
-	// cos(x) = sqrt(1-sin^2(x))
+	// cos(x) = sin(pi/2 - x)
 	float cos_a = pi_over_two_float - bf16_to_fp32(a);
 	bf16_t cos_x = chebyshev_sin_6terms(cos_a);
 
-	// k mod 4
 	unsigned mod_k = k % 4;
 	switch (mod_k) {
 		case 0:
