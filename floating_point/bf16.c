@@ -415,56 +415,6 @@ static bf16_t bf16_floor(bf16_t a)
 	return (bf16_t) {.bits = (sign << 15) | ((exp & 0xFF) << 7) | (mant & 0x7F)};
 }
 
-static uint32_t bf16_to_uint32(bf16_t a)
-{
-	uint16_t exp = (a.bits >> 7) & 0xFF;
-	uint32_t mant = a.bits & 0x7F;
-	mant |= 0x80;
-	int16_t unbiased_exp = exp - 127;
-
-	if (unbiased_exp >= 7) mant <<= (unbiased_exp - 7);
-	if (unbiased_exp >= 0 && unbiased_exp < 7) mant >>= (7 - unbiased_exp);
-
-	return mant;
-}
-
-static inline void tylor_sin(bf16_t *result, bf16_t *it, bf16_t *it_deno, bf16_t *it_mole, bf16_t *it_n)
-{	
-	*it_deno = bf16_add(bf16_mul(bf16_four, bf16_mul(*it_n, *it_n)), bf16_mul(bf16_two, *it_n));
-	*it = bf16_mul(*it, *it_mole);
-	*it = bf16_div(*it, *it_deno);
-	it->bits ^= sign.bits;
-	*it_n = bf16_add(*it_n, bf16_one);
-	
-	*result = bf16_add(*result, *it);
-}
-
-static bf16_t tylor_sin_loop_unrool(bf16_t a)
-{
-	bf16_t result = a, it_mole = bf16_mul(a, a), it_deno, it = a, it_n = bf16_one;
-
-	tylor_sin(&result, &it, &it_deno, &it_mole, &it_n);
-	tylor_sin(&result, &it, &it_deno, &it_mole, &it_n);
-	tylor_sin(&result, &it, &it_deno, &it_mole, &it_n);
-	tylor_sin(&result, &it, &it_deno, &it_mole, &it_n);
-	tylor_sin(&result, &it, &it_deno, &it_mole, &it_n);
-	tylor_sin(&result, &it, &it_deno, &it_mole, &it_n);
-	tylor_sin(&result, &it, &it_deno, &it_mole, &it_n);
-
-	return result;
-}
-
-static bf16_t chebyshev_sin_5terms(bf16_t a)
-{
-	float para = bf16_to_fp32(a);
-	float x_2 = para*para;
-	float x_3 = x_2*para;
-	float x_4 = x_3*para;
-	float result = 0.0368*x_4-0.2311*x_3+0.0489*x_2+0.9867*para+0.0005833;
-	// degress 5 to small, so ignore
-	return fp32_to_bf16(result);
-}
-
 static bf16_t chebyshev_sin_6terms(float a)
 {
 	float para = a;
@@ -547,104 +497,34 @@ float trig_red_slowpath_f (float a, int *quadrant)
     return r;
 }
 
-// 200 bits for 2/pi
-static const uint8_t two_over_pi_byte[27] = {
-    0xA2, 0xF8, 0xC1, 0xB7, 0x27, 0x22, 0x0A, 0x94,
-    0xFE, 0x13, 0xA7, 0x55, 0xF4, 0x3E, 0xA6, 0xD7,
-    0xC0, 0x6D, 0xB1, 0x4A, 0xCC, 0x9E, 0x21, 0xC8,
-    0x20, 0xFF, 0x28
-};
-
-typedef union {
-	double f;
-	uint64_t bits;
-} fp64_bits;
-
-static bf16_t quot(bf16_t a)
-{
-	// a*(2/pi), using fixed point Q2.30
-	uint16_t sign = (a.bits >> 15) & 0x1;
-	uint16_t exp = (a.bits >> 7) & 0xFF;
-	uint32_t mant = a.bits & 0x7F;
-	int16_t unbiased_exp = exp - 127;
-
-	// Q2.30
-	mant |= 0x80;
-	mant <<= 23;
-	uint32_t two_over_pi_bits = (two_over_pi_byte[0]<<22) | (two_over_pi_byte[1]<<14)
-	    | (two_over_pi_byte[2]<<6) | (two_over_pi_byte[3]>>2);
-
-	uint32_t quo = ((uint64_t)mant * two_over_pi_bits) >> 30;
-	if (quo >> 30 == 0) {
-		exp -= 1;
-		quo <<= 1;
-	}
-
-    	return (bf16_t) {.bits = (sign << 15) | ((exp & 0xFF) << 7) |
-                             ((quo >> 23) & 0x7F)};
-}
-
-static bf16_t mod_range_reduc(bf16_t *k, bf16_t a)
-{
-	bf16_t quotient = bf16_div(a, pi_over_two_bits);
-	*k = bf16_floor(quotient);
-	a = bf16_sub(a, bf16_mul(*k, pi_over_two_bits));
-
-	printf("\nk: %f, after naive mod reduction: %f\n",bf16_to_fp32(*k) ,bf16_to_fp32(a));
-	return a;
-}
-
-/*
- * C = C1+C2+C3
- * x* = x-kC = x-kC1-kC2-kC3 = ((x-kC1)-kC2)-kC3
- */
-static bf16_t cody_waite_reduc(bf16_t *k, bf16_t a)
-{
-	bf16_t c_big = pi_over_two_bits;
-	bf16_t c_med = (bf16_t) { .bits = 0b0011100111111100};
-	bf16_t c_sm = (bf16_t) {.bits = 0b0011011001010100};
-	*k = quot(a);
-	*k = bf16_floor(*k);
-	a = bf16_sub(bf16_sub(bf16_sub(a, bf16_mul(*k, c_big)), bf16_mul(*k, c_med)), bf16_mul(*k, c_sm));
-	
-	printf("\nk: %f, after cody-waite reduction: %f\n",bf16_to_fp32(*k) ,bf16_to_fp32(a));
-	return a;
-}
-
 static bf16_t bf16_sin(bf16_t a, int *record_k)
 {
-	bf16_t k;
-	int32_t kpayne;
-	uint16_t isPayne = 0;
+	uint16_t sign = (a.bits >> 15) & 0x1;
+	a.bits &= 0x7FFF;
+	int32_t k = 0;
+	bf16_t result;
+
+	// a so small, let sin(a) = a
 	if ((a.bits & 0x7FFF) < 0b0011111000010000) {
-		printf("directly return a\n");
+		if (sign) a.bits ^= 0x8000;
 		return a;
-	} 
+	}
+
+	// range reduction	
 	if ((a.bits & 0x7FFF) >= 0b0011111111001010) {
-		a = fp32_to_bf16(trig_red_slowpath_f(bf16_to_fp32(a), &kpayne));
-		isPayne = 1;
+		a = fp32_to_bf16(trig_red_slowpath_f(bf16_to_fp32(a), &k));
+		printf("Angle after range reduction: %f\n", bf16_to_fp32(a));
 	}
 	
 	// sin(x)
-	printf("angle after range reduction: %f\n", bf16_to_fp32(a));
-	bf16_t result = chebyshev_sin_6terms(bf16_to_fp32(a));
-	bf16_t sin_x = result;
+	bf16_t sin_x = chebyshev_sin_6terms(bf16_to_fp32(a));
 
 	// cos(x) = sqrt(1-sin^2(x))
-	//bf16_t cos_a = bf16_add(pi_over_two_bits, a);
-	float cos_a = pi_over_two_float + bf16_to_fp32(a);
-	result = chebyshev_sin_6terms(cos_a);
-	bf16_t cos_x = result;
+	float cos_a = pi_over_two_float - bf16_to_fp32(a);
+	bf16_t cos_x = chebyshev_sin_6terms(cos_a);
 
 	// k mod 4
-	uint32_t k_int;
-	if (isPayne){
-		k_int = (uint32_t) kpayne;
-	}
-	else {
-		k_int = bf16_to_uint32(k); 
-	}
-	unsigned mod_k = k_int % 4;
+	unsigned mod_k = k % 4;
 	switch (mod_k) {
 		case 0:
 			result = sin_x;
@@ -661,39 +541,7 @@ static bf16_t bf16_sin(bf16_t a, int *record_k)
 	}
 	
 	*record_k = mod_k;
-	printf("sin(r) = %f, cos(r) = %f, k_int = %d, mod_k = %d\n", bf16_to_fp32(sin_x), bf16_to_fp32(cos_x),k_int, mod_k);
+	printf("sin(r) = %f, cos(r) = %f, k = %d, mod_k = %d\n", bf16_to_fp32(sin_x), bf16_to_fp32(cos_x),k, mod_k);
+	if (sign) result.bits ^= 0x8000;
 	return result;
-}
-
-int main()
-{
-	FILE *f = fopen("./log.txt", "w");
-	FILE *fk = fopen("./klog.txt", "w");
-	
-	/* x between [pi/2, 0] 
-	 * bf16_t i = (bf16_t){.bits = 0b0011111111001001}; // Initial
-	int j = 0;
-	for (j; j < 450; j++){
-		printf("%f\n", bf16_to_fp32(i));
-		float glibc_sin = bf16_to_fp32(fp32_to_bf16(sinf(bf16_to_fp32(i))));
-		float payne = bf16_to_fp32(bf16_sin(i));
-		printf("i = %f, bf16_sin = %f ,glibc_sin = %f\n", bf16_to_fp32(i), payne, glibc_sin);
-		fprintf(f, "%f\n",fabs(payne-glibc_sin));
-		i.bits--;
-	}*/
-
-	// x larger than pi/2, need range reduction
-	bf16_t i = (bf16_t){.bits = 0b0011111111001010}; // Initial
-	int j = 0, record_k;
-	for (j; j < 16310; j++){
-		float glibc_sin = bf16_to_fp32(fp32_to_bf16(sinf(bf16_to_fp32(i))));
-		float payne = bf16_to_fp32(bf16_sin(i, &record_k));
-		printf("i = %f, bf16_sin = %f ,glibc_sin = %f\n\n", bf16_to_fp32(i), payne, glibc_sin);
-		if (fabs(payne-glibc_sin) > 0) fprintf(fk, "%d\n", record_k);
-		fprintf(f, "%f\n",fabs(payne-glibc_sin));
-		i.bits++;
-	}
-
-	fclose(f);
-	return 0;
 }
