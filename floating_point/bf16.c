@@ -504,6 +504,11 @@ static bf16_t bf16_sin(bf16_t a, int *record_k)
 	int32_t k = 0;
 	bf16_t result;
 
+	// flush out subnormal a
+	if (((a.bits >> 7) & 0xFF) == 0x0) {
+		return (bf16_t) {.bits = 0};
+	}
+	
 	// a so small, let sin(a) = a
 	if ((a.bits & 0x7FFF) < 0b0011111000010000) {
 		if (sign) a.bits ^= 0x8000;
