@@ -18,8 +18,7 @@
 #include <stdbool.h>
 #include <math.h>
 #include <stdlib.h>
-
-typedef struct { uint16_t bits;} bf16_t;
+#include "bf16.h"
 
 #define BF16_EXP_BIAS 127
 #define BF16_SIGN_MASK 0x8000U
@@ -54,7 +53,7 @@ static inline bool bf16_iszero(bf16_t a)
 }
 
 // remember to deal with special cases
-static inline bf16_t fp32_to_bf16(float val)
+inline bf16_t fp32_to_bf16(float val)
 {
 	uint32_t f32bits;
 	memcpy(&f32bits, &val, sizeof(float));
@@ -68,7 +67,7 @@ static inline bf16_t fp32_to_bf16(float val)
 	return (bf16_t) {.bits = f32bits >> 16};	
 }
 
-static inline float bf16_to_fp32 (bf16_t val)
+inline float bf16_to_fp32 (bf16_t val)
 {
 	uint32_t f32bits = ((uint32_t) val.bits) << 16;
 	float result;
@@ -433,6 +432,51 @@ static bf16_t chebyshev_sin_6terms(float a)
 	return fp32_to_bf16(result);
 }
 
+static inline uint16_t q2_14_mul(uint16_t a, uint16_t b)
+{
+	uint32_t mul = (uint32_t) a * b;
+	mul += (mul & 0x2000); // rounding
+	mul >>= 14;
+	return (uint16_t) mul;
+}
+
+static bf16_t chebyshev_sin_8degrees(bf16_t a)
+{
+	// Q2.14
+	if (a.bits >= 0b0011111111000010 && a.bits <= 0b0011111111010000) return (bf16_t){.bits = 0x3F80};
+	uint16_t sign = a.bits >> 15;
+	int16_t exp = ((a.bits >> 7) & 0xFF) - 127;
+	uint16_t mant = (a.bits & 0x7F) | 0x80;
+	uint16_t fixed_a = mant << 7;
+	if (exp >= 0) fixed_a <<= exp;
+	else fixed_a >>= (-exp);
+
+	uint16_t pi_over_two = 0b0110010010000111, y;
+	if (pi_over_two > fixed_a) y = pi_over_two - fixed_a;
+	else y = fixed_a - pi_over_two;
+	uint16_t y2 = q2_14_mul(y, y);
+	uint16_t c6 = 0b0000000000010110; // 0.00138
+	uint16_t c4 = 0b0000001010101010; // 0.04166 
+	uint16_t c2 = 0b0001111111111111; // 0.49999
+	uint16_t c0 = 0b0100000000000000; // 1
+	uint16_t result = c4;
+	uint16_t tmp = q2_14_mul(c6, y2);
+	result -= tmp;
+	result = q2_14_mul(result, y2);
+	tmp = c2 - result;
+	tmp = q2_14_mul(tmp, y2);
+	result = c0-tmp;
+
+	uint16_t result_exp = 127, result_mant = 0;
+	while ((result >> 14) == 0) {
+		result_exp--;
+		result <<= 1;
+	}
+	result_mant = ((result >> 7) & 0x7F) + ((result >> 6) & 0x1); // rounding
+	return (bf16_t) {.bits = ((sign << 15) | (result_exp << 7) | (result_mant & 0x7F))
+		+ (result_mant & 0x80)}; // if rounding happen carry add to exp
+}
+
 /* 190 bits of 2/pi for Payne-Hanek style argument reduction. */
 static const unsigned int two_over_pi_f [] = 
 {
@@ -454,7 +498,7 @@ float payne_hanek_reduc (float a, int *quadrant)
 
     ia = (unsigned int)(fabsf (frexpf (a, &e)) * 0x1.0p32f);
 
-    /* extract 96 relevant bits of 2/pi based on magnitude of argument */ 
+    // extract 96 relevant bits of 2/pi based on magnitude of argument
     i = (unsigned int)e >> 5;
     e = (unsigned int)e & 31;
 
@@ -468,12 +512,12 @@ float payne_hanek_reduc (float a, int *quadrant)
         lo  = two_over_pi_f [i+2];
     }
 
-    /* compute product x * 2/pi in 2.62 fixed-point format */
+    // compute product x * 2/pi in 2.62 fixed-point format
     p = (unsigned long long int)ia * lo;
     p = (unsigned long long int)ia * mid + (p >> 32);
     p = ((unsigned long long int)(ia * hi) << 32) + p;
 
-    /* round quotient to nearest */
+    // round quotient to nearest
     q = (int)(p >> 62);                // integral portion = quadrant<1:0>
     p = p & 0x3fffffffffffffffULL;     // fraction
     if (p & 0x2000000000000000ULL) {   // fraction >= 0.5
@@ -481,7 +525,7 @@ float payne_hanek_reduc (float a, int *quadrant)
         q = q + 1;
     }
 
-    /* compute remainder of x / (pi/2) */
+    // compute remainder of x / (pi/2)
     double d;
 
     d = (double)(long long int)p;
@@ -492,12 +536,11 @@ float payne_hanek_reduc (float a, int *quadrant)
         q = -q;
     }
 
-    printf("After payne_hanek\n");
     *quadrant = q;
     return r;
 }
 
-static bf16_t bf16_sin(bf16_t a, int *record_k)
+bf16_t bf16_sin(bf16_t a, int *record_k)
 {
 	uint16_t sign = (a.bits >> 15) & 0x1;
 	a.bits &= 0x7FFF;
@@ -509,8 +552,8 @@ static bf16_t bf16_sin(bf16_t a, int *record_k)
 		return (bf16_t) {.bits = 0};
 	}
 	
-	// a so small, let sin(a) = a
-	if ((a.bits & 0x7FFF) < 0b0011111000010000) {
+	// a so small 0.11
+	if (a.bits < 0b0011111000010011) {
 		if (sign) a.bits ^= 0x8000;
 		return a;
 	}
@@ -518,15 +561,14 @@ static bf16_t bf16_sin(bf16_t a, int *record_k)
 	// range reduction	
 	if ((a.bits & 0x7FFF) >= 0b0011111111001010) {
 		a = fp32_to_bf16(payne_hanek_reduc(bf16_to_fp32(a), &k));
-		printf("Angle after range reduction: %f\n", bf16_to_fp32(a));
 	}
 	
 	// sin(x)
-	bf16_t sin_x = chebyshev_sin_6terms(bf16_to_fp32(a));
+	bf16_t sin_x = chebyshev_sin_8degrees(a);
 
 	// cos(x) = sin(pi/2 - x)
-	float cos_a = pi_over_two_float - bf16_to_fp32(a);
-	bf16_t cos_x = chebyshev_sin_6terms(cos_a);
+	float cos_a = pi_over_two_float + bf16_to_fp32(a);
+	bf16_t cos_x = chebyshev_sin_8degrees(fp32_to_bf16(cos_a));
 
 	unsigned mod_k = k % 4;
 	switch (mod_k) {
@@ -545,7 +587,6 @@ static bf16_t bf16_sin(bf16_t a, int *record_k)
 	}
 	
 	*record_k = mod_k;
-	printf("sin(r) = %f, cos(r) = %f, k = %d, mod_k = %d\n", bf16_to_fp32(sin_x), bf16_to_fp32(cos_x),k, mod_k);
 	if (sign) result.bits ^= 0x8000;
 	return result;
 }
