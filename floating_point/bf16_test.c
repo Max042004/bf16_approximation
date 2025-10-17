@@ -5,9 +5,9 @@
 
 int main()
 {
-	FILE *f1 = fopen("./log/range1.txt", "w");
-	FILE *f2 = fopen("./log/range2.txt", "w");
-	FILE *f3 = fopen("./log/range3.txt", "w");
+	FILE *f1 = fopen(".range1.log", "w");
+	FILE *f2 = fopen(".range2.log", "w");
+	FILE *f3 = fopen(".range3.log", "w");
 	
 	// x between [pi/2, 0] 
 	bf16_t i = (bf16_t){.bits = 0b0011111111001001}; // Initial
