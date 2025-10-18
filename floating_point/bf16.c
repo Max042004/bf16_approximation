@@ -435,7 +435,7 @@ static bf16_t chebyshev_sin_6terms(float a)
 static inline uint16_t q2_14_mul(uint16_t a, uint16_t b)
 {
 	uint32_t mul = (uint32_t) a * b;
-	mul += (mul & 0x2000); // rounding
+	mul += ((mul & 0x2000) & (mul >> 1)); // round to even
 	mul >>= 14;
 	return (uint16_t) mul;
 }
@@ -455,9 +455,10 @@ static bf16_t chebyshev_sin_8degrees(bf16_t a)
 	if (pi_over_two > fixed_a) y = pi_over_two - fixed_a;
 	else y = fixed_a - pi_over_two;
 	uint16_t y2 = q2_14_mul(y, y);
-	uint16_t c6 = 0b0000000000010110; // 0.00138
-	uint16_t c4 = 0b0000001010101010; // 0.04166 
-	uint16_t c2 = 0b0001111111111111; // 0.49999
+
+	uint16_t c6 = 0b0000000000010111; // 0.00138
+	uint16_t c4 = 0b0000001010101011; // 0.04166 
+	uint16_t c2 = 0b0010000000000000; // 0.49999
 	uint16_t c0 = 0b0100000000000000; // 1
 	uint16_t result = c4;
 	uint16_t tmp = q2_14_mul(c6, y2);
