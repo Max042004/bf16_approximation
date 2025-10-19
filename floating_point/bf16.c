@@ -456,7 +456,7 @@ static bf16_t chebyshev_sin_8degrees(bf16_t a)
 	else y = fixed_a - pi_over_two;
 	uint16_t y2 = q2_14_mul(y, y);
 
-	uint16_t c6 = 0b0000000000010111; // 0.00138
+	uint16_t c6 = 0b0000000000010110; // 0.00138
 	uint16_t c4 = 0b0000001010101011; // 0.04166 
 	uint16_t c2 = 0b0010000000000000; // 0.49999
 	uint16_t c0 = 0b0100000000000000; // 1
